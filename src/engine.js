@@ -1,0 +1,319 @@
+import { config } from './config.js';
+import { normalizeText, detectIntent } from './normalizer.js';
+import { OpenAIClient } from './ai.js';
+import * as db from './db.js';
+import { guardDecision } from './guard.js';
+import { greetingText } from './greeting.js';
+import { dispatchHumanRequest } from './human-bridge.js';
+
+const ai = new OpenAIClient();
+function formatRows(rows, fields){ return rows.map(r=>fields.map(f=>r[f]).filter(Boolean).join(' | ')).join('\n'); }
+function safeHoldingReply(){ return 'Baik bosku, kami bantu cek dulu ya 😊🙏'; }
+
+function customerTexts(rows){ return rows.filter(x=>x.sender_type==='customer').map(x=>String(x.text||'').trim()).filter(Boolean); }
+function extractUserId(rows){
+  const text=customerTexts(rows).join('\n');
+  const pats=[/(?:user\s*id|userid|username|id\s*(?:saya|akun)?)\s*[:=]?\s*([a-z0-9_.-]{3,40})/i,/\b(?:id)\s*[:=]\s*([a-z0-9_.-]{3,40})/i];
+  for(const re of pats){const m=text.match(re);if(m?.[1])return m[1];}
+  return '';
+}
+function extractAccountData(rows){
+  const text=customerTexts(rows).join('\n');
+  const lower=text.toLowerCase();
+  const types=['seabank','bca','bri','bni','mandiri','cimb','jago','dana','ovo','gopay','linkaja','shopeepay','bank'];
+  const type=types.find(x=>lower.includes(x))||'';
+  const no=(text.match(/(?:no\.?\s*(?:rek(?:ening)?|rekening|akun)|nomor\s*(?:rek(?:ening)?|rekening|akun))\s*[:=]?\s*(\d{6,22})/i)||text.match(/\b(\d{8,22})\b/))?.[1]||'';
+  const name=(text.match(/(?:nama\s*(?:rek(?:ening)?|rekening)?|atas\s*nama|a\.?n\.?)\s*[:=]?\s*([a-z][a-z .'-]{2,60})/i))?.[1]?.trim()||'';
+  return {type,name,no};
+}
+function latestProof(rows){
+  const all=rows.filter(x=>x.sender_type==='customer').flatMap(x=>Array.isArray(x.attachments)?x.attachments:[]);
+  return all.reverse().find(a=>a?.isImage||String(a?.mimeType||a?.type||'').startsWith('image/'))||null;
+}
+async function askAndTrack(livechat,chatId,intent,type,state,data,reply){
+  await db.setConversationWorkflow(chatId,{type,state,data});
+  await sendAndStore(livechat,chatId,reply,intent);
+  return {intent,workflow:type,state,sent:true,reply};
+}
+async function makeHumanRequest({chatId,eventId,intent,text,question,holding,livechat}){
+  const req=await db.createHumanRequest({chatId,sourceEventId:eventId,intent,memberMessage:text,question});
+  await dispatchHumanRequest(req);
+  if(holding) await sendAndStore(livechat,chatId,holding,intent);
+  return {intent,humanRequestId:req.id,sent:Boolean(holding),waitingHuman:true};
+}
+async function maybeHandleOperationalFlow({chatId,eventId,text,intent,livechat}){
+  const wf=await db.getConversationWorkflow(chatId);
+  const ctx=await db.getContext(chatId,30);
+  const effective=String(intent||'GENERAL').toUpperCase();
+
+  // Deposit complaint: never send to staff until user ID + proof transfer are present.
+  if(effective==='DEPOSIT_PROBLEM' || wf?.workflow_type==='DEPOSIT_VERIFY'){
+    const userId=extractUserId(ctx); const proof=latestProof(ctx);
+    const data={...(wf?.workflow_data||{}),userId:userId||wf?.workflow_data?.userId||'',proofUrl:proof?.url||wf?.workflow_data?.proofUrl||''};
+    const missing=[]; if(!data.userId)missing.push('user ID'); if(!data.proofUrl)missing.push('bukti transfer');
+    if(missing.length){
+      const reply=missing.length===2?'Boleh kirim user ID sama bukti transfernya ya bosku 🙏 Biar kami bantu cek depositnya.':missing[0]==='user ID'?'Boleh kirim user ID-nya ya bosku 🙏 Bukti transfernya sudah kami terima.':'Boleh kirim bukti transfernya ya bosku 🙏 User ID-nya sudah kami terima.';
+      return askAndTrack(livechat,chatId,'DEPOSIT_PROBLEM','DEPOSIT_VERIFY','COLLECTING',data,reply);
+    }
+    await db.clearConversationWorkflow(chatId);
+    return makeHumanRequest({chatId,eventId,intent:'DEPOSIT_PROBLEM',text,livechat,holding:'Siap bosku, user ID dan bukti transfernya sudah kami terima 🙏 Kami bantu teruskan untuk dicek depositnya.',question:`Mohon cek deposit member.\nUser ID: ${data.userId}\nBukti transfer: ${data.proofUrl}\nJika dana masuk, pilih tombol DP MASUK agar AI konfirmasi deposit telah diproses. Jika belum terlihat, pilih DP BELUM MASUK.`});
+  }
+
+  // Reset password: collect complete registered account data before asking CS.
+  if(effective==='FORGOT_PASSWORD' || wf?.workflow_type==='RESET_PASSWORD'){
+    const acc=extractAccountData(ctx); const prev=wf?.workflow_data||{};
+    const data={type:acc.type||prev.type||'',name:acc.name||prev.name||'',no:acc.no||prev.no||'',userId:extractUserId(ctx)||prev.userId||''};
+    const missing=[]; if(!data.type)missing.push('jenis rekening/bank/e-wallet'); if(!data.name)missing.push('nama rekening'); if(!data.no)missing.push('nomor rekening');
+    if(missing.length){
+      return askAndTrack(livechat,chatId,'FORGOT_PASSWORD','RESET_PASSWORD','COLLECTING',data,`Boleh bantu kirim data rekening terdaftar dulu ya bosku 🙏 Yang dibutuhkan: ${missing.join(', ')}.`);
+    }
+    await db.clearConversationWorkflow(chatId);
+    return makeHumanRequest({chatId,eventId,intent:'FORGOT_PASSWORD',text,livechat,holding:'Siap bosku, datanya sudah lengkap 🙏 Kami bantu teruskan untuk proses reset password.',question:`Mohon proses reset password member.\n${data.userId?`User ID: ${data.userId}\n`:''}Jenis rekening: ${data.type}\nNama rekening: ${data.name}\nNo rekening: ${data.no}\nReply ticket dengan User ID/Username + Password (+ link login bila ada).`});
+  }
+
+  // Every WD problem goes to staff. AI may acknowledge but cannot decide the status itself.
+  if(effective==='WITHDRAW_PROBLEM'){
+    const uid=extractUserId(ctx); const all=customerTexts(ctx).slice(-5).join(' | ');
+    return makeHumanRequest({chatId,eventId,intent:'WITHDRAW_PROBLEM',text,livechat,holding:'Siap bosku, kami bantu teruskan pengecekan WD-nya dulu ya 🙏',question:`Mohon cek kendala WD member.${uid?`\nUser ID: ${uid}`:''}\nKonteks terbaru: ${all.slice(0,1200)}`});
+  }
+
+  // All bonus requests need staff approval/process.
+  if(effective.includes('BONUS')){
+    const uid=extractUserId(ctx); const all=customerTexts(ctx).slice(-5).join(' | ');
+    return makeHumanRequest({chatId,eventId,intent:effective,text,livechat,holding:'Siap bosku, kami bantu cek bonusnya dulu ya 🙏',question:`Mohon cek kelayakan/proses bonus member.${uid?`\nUser ID: ${uid}`:''}\nKonteks terbaru: ${all.slice(0,1200)}`});
+  }
+  return null;
+}
+
+function normalizeShortcut(s=''){ return String(s||'').trim().replace(/^#?/,'#'); }
+async function responseText(shortcut,fallback){
+  const r=await db.getCannedByShortcut(normalizeShortcut(shortcut));
+  return String(r?.content||fallback||'').trim().slice(0,1200);
+}
+function resetReplyComplete(text=''){
+  const s=String(text||'');
+  return /(?:user\s*id|userid|username)\s*[:=]/i.test(s) && /(?:password|psw)\s*[:=]/i.test(s);
+}
+async function maybeHandleWorkflow({chatId,eventId,text,intent,livechat}){
+  const wf=await db.getConversationWorkflow(chatId);
+  if(wf?.workflow_type!=='WD_REPLACEMENT' || wf?.workflow_state!=='WAITING_MEMBER_ACCOUNT') return null;
+  const req=await db.createHumanRequest({
+    chatId,sourceEventId:eventId,intent:'WITHDRAW_PROBLEM',memberMessage:text,
+    question:`Member sudah memberikan data rekening pengganti untuk WD. Mohon alihkan WD ke rekening berikut:\n${String(text||'').slice(0,1200)}`
+  });
+  await db.clearConversationWorkflow(chatId);
+  await dispatchHumanRequest(req);
+  const hold='Siap bosku, data rekening penggantinya sudah kami terima 🙏 Kami bantu teruskan untuk pengalihan WD ya.';
+  await sendAndStore(livechat,chatId,hold,'WITHDRAW_PROBLEM');
+  await db.logAI({chatId,sourceEventId:eventId,intent:'WITHDRAW_PROBLEM',action:'WORKFLOW_TO_HUMAN',confidence:1,reply:hold,reason:`WD replacement workflow -> Human Request #${req.id}`});
+  return {intent:'WITHDRAW_PROBLEM',workflow:'WD_REPLACEMENT',humanRequestId:req.id,sent:true};
+}
+
+async function getReplyStyle(){
+  return {
+    replyStyle:String(await db.getSetting('reply_style','NATURAL_CS')||'NATURAL_CS'),
+    replyLength:String(await db.getSetting('reply_length','SHORT')||'SHORT'),
+    boskuUsage:String(await db.getSetting('bosku_usage','MODERATE')||'MODERATE'),
+    emojiUsage:String(await db.getSetting('emoji_usage','LIGHT')||'LIGHT'),
+    formalLanguage:Boolean(await db.getSetting('formal_language',false)),
+    replyStyleNote:String(await db.getSetting('reply_style_note','')||'')
+  };
+}
+
+async function sendAndStore(livechat,chatId,text,intent,senderType='ai'){
+  if(senderType==='ai' && await db.isHumanTakeover(chatId)) throw new Error('HUMAN_TAKEOVER_ACTIVE');
+  const sent=await livechat.sendMessage(chatId,text);
+  const sentEventId=sent?.event_id || sent?.id || null;
+  await db.saveOutbound(chatId,text,sentEventId);
+  if(sentEventId) await db.insertMessage({chatId,eventId:String(sentEventId),senderType,authorId:'',text,normalizedText:normalizeText(text),intent,createdAt:new Date().toISOString()});
+  return sent;
+}
+
+async function buildSources(chatId,intent,normalized){
+  const contextRows=await db.getContext(chatId,config.aiMaxContext);
+  const rulesRows=await db.getRules(intent); const kbRows=await db.getKnowledge(intent);
+  const query=`${normalized} ${contextRows.filter(m=>m.sender_type==='customer').slice(-3).map(m=>m.text).join(' ')}`;
+  const cannedRows=await db.getRelevantCanned(query,8);
+  const learningRows=await db.getRelevantLearning(query,intent,6);
+  const context=contextRows.map(m=>`${m.sender_type==='customer'?'MEMBER':m.sender_type==='ai'?'AI':m.sender_type==='system'?'SYSTEM':'AGENT'}: ${m.text}`).join('\n');
+  const rules=formatRows(rulesRows,['category','rule_type','content']);
+  const manualKnowledge=formatRows(kbRows,['category','title','content']);
+  const responses=cannedRows.map(r=>`[RESPONSE ${r.shortcut||r.title||r.source_id}] [${r.response_mode||'FLEXIBLE'}] [${r.category||'GENERAL'}] ${r.content}`).join('\n');
+  const learning=learningRows.map(r=>`[BELAJAR ${r.source_type}] [${r.intent}] Member: ${r.member_text} => Jawaban benar: ${r.correction_text||r.response_text}`).join('\n');
+  const attachments=contextRows.filter(m=>m.sender_type==='customer').slice(-4).flatMap(m=>Array.isArray(m.attachments)?m.attachments:[]).filter(a=>a?.isImage).slice(-3);
+  return {context,rules,knowledge:[manualKnowledge,responses,learning].filter(Boolean).join('\n'),hasKnowledge:Boolean(manualKnowledge||responses||learning),attachments};
+}
+
+export async function processCustomerMessage({chatId,eventId,text,createdAt,livechat,attachments=[]}) {
+  const beforeState=await db.getConversationState(chatId);
+  const wasNew=Number(beforeState?.message_count||0)===0;
+  const normalized=normalizeText(text); const intent=detectIntent(text);
+  const inserted=await db.insertMessage({chatId,eventId,senderType:'customer',text,normalizedText:normalized,intent,createdAt,authorId:'',attachments});
+  if (!inserted) return {skipped:'duplicate'};
+
+  return db.withChatLock(chatId, async()=>{
+    // Re-check after obtaining the per-chat lock so a human Take Over always wins
+    // against an AI reply that was being prepared concurrently.
+    if (await db.isHumanTakeover(chatId)) return {skipped:'human_takeover'};
+    const systemEnabled=Boolean(await db.getSetting('system_enabled',true));
+    if (!systemEnabled) return {skipped:'system_off',intent,normalized};
+    const auto=Boolean(await db.getSetting('auto_reply',config.autoReplyDefault));
+    if (!auto) return {skipped:'auto_reply_off',intent,normalized};
+
+    const workflowResult=await maybeHandleWorkflow({chatId,eventId,text,intent,livechat});
+    if(workflowResult) return workflowResult;
+
+    const openHuman=await db.getOpenHumanRequest(chatId);
+    if(openHuman) return {skipped:'waiting_human',intent,humanRequestId:openHuman.id};
+
+    const operationalResult=await maybeHandleOperationalFlow({chatId,eventId,text,intent,livechat});
+    if(operationalResult) return operationalResult;
+
+    const greetingEnabled=Boolean(await db.getSetting('greeting_enabled',config.greetingEnabled));
+    let greeted=false;
+    if(greetingEnabled && wasNew && await db.claimGreeting(chatId,{onlyIfNew:true})){
+      try{ await sendAndStore(livechat,chatId,greetingText(new Date(),config.timezone),'GREETING'); greeted=true; }
+      catch(e){ if(e.message==='HUMAN_TAKEOVER_ACTIVE') return {skipped:'human_takeover'}; await db.logError('engine','GREETING_SEND_FAILED',e.message,{chatId}); }
+    }
+    if(greeted && intent==='GREETING') return {intent,decision:{action:'AUTO_REPLY',confidence:1,reply:null,reason:'greeting_sent'},sent:true};
+
+    const src=await buildSources(chatId,intent,normalized);
+    try {
+      const mergedAttachments=[...(src.attachments||[]),...(attachments||[])].filter((a,i,arr)=>a?.url&&arr.findIndex(x=>x?.url===a.url)===i).slice(-3);
+      let aiAttachments=mergedAttachments;
+      if(mergedAttachments.length && typeof livechat.prepareImageAttachments==='function'){
+        try{ aiAttachments=await livechat.prepareImageAttachments(mergedAttachments); }catch{}
+      }
+      const style=await getReplyStyle();
+      let decision=await ai.classifyAndReply({normalized,intent,context:src.context,rules:src.rules,knowledge:src.knowledge,attachments:aiAttachments,style});
+      if (decision.confidence < config.aiConfidence && !['ASK_INFO'].includes(decision.action)) decision.action='ASK_HUMAN';
+      if(['AUTO_REPLY','ASK_INFO'].includes(decision.action)) decision=guardDecision({intent,decision,hasKnowledge:src.hasKnowledge});
+
+      // Human can press Take Over while OpenAI is thinking. Check once more before any action/send.
+      if (await db.isHumanTakeover(chatId)) return {skipped:'human_takeover_after_ai'};
+
+      if(['ASK_HUMAN','HANDOFF'].includes(decision.action)){
+        const humanAsk=Boolean(await db.getSetting('human_ask_enabled',config.humanAskEnabled));
+        if(humanAsk){
+          const question=decision.humanQuestion || `Mohon bantu tentukan jawaban untuk member ini. Intent: ${intent}. Pesan: ${text}`;
+          const req=await db.createHumanRequest({chatId,sourceEventId:eventId,intent,memberMessage:text,question});
+          await dispatchHumanRequest(req);
+          const holding=decision.reply?.trim() || safeHoldingReply();
+          if(holding && !(await db.isHumanTakeover(chatId))) await sendAndStore(livechat,chatId,holding,intent);
+          await db.logAI({chatId,sourceEventId:eventId,intent,...decision,reply:holding,reason:`${decision.reason||''} | human_request:${req.id}`});
+          return {intent,decision,humanRequestId:req.id,sent:Boolean(holding)};
+        }
+        await db.logAI({chatId,sourceEventId:eventId,intent,...decision});
+        return {intent,decision};
+      }
+
+      if (!decision.reply) {
+        await db.logAI({chatId,sourceEventId:eventId,intent,...decision});
+        return {intent,decision};
+      }
+      if (await db.isHumanTakeover(chatId)) return {skipped:'human_takeover_before_send'};
+      await sendAndStore(livechat,chatId,decision.reply,intent);
+      await db.logAI({chatId,sourceEventId:eventId,intent,...decision});
+      return {intent,decision,sent:true};
+    } catch (e) {
+      if(e.message==='HUMAN_TAKEOVER_ACTIVE') return {skipped:'human_takeover'};
+      await db.logAI({chatId,sourceEventId:eventId,intent,error:e.message});
+      await db.logError('engine','AI_PROCESS_FAILED',e.message,{chatId,eventId,intent});
+      if(Boolean(await db.getSetting('human_ask_enabled',config.humanAskEnabled)) && !(await db.isHumanTakeover(chatId))){
+        const req=await db.createHumanRequest({chatId,sourceEventId:eventId,intent,memberMessage:text,question:`AI gagal menentukan jawaban (${e.message}). Mohon berikan instruksi balasan untuk member.`});
+        await dispatchHumanRequest(req);
+        return {intent,error:e.message,humanRequestId:req.id};
+      }
+      return {intent,error:e.message};
+    }
+  });
+}
+
+
+
+export async function processGreetingTrigger({chatId,eventId,text,createdAt,livechat}){
+  return db.withChatLock(chatId, async()=>{
+    if (await db.isHumanTakeover(chatId)) return {skipped:'human_takeover'};
+    const systemEnabled=Boolean(await db.getSetting('system_enabled',true));
+    if(!systemEnabled) return {skipped:'system_off'};
+    const auto=Boolean(await db.getSetting('auto_reply',config.autoReplyDefault));
+    if(!auto) return {skipped:'auto_reply_off'};
+    const greetingEnabled=Boolean(await db.getSetting('greeting_enabled',config.greetingEnabled));
+    if(!greetingEnabled) return {skipped:'greeting_off'};
+    if(!(await db.claimGreeting(chatId,{onlyIfNew:false}))) return {skipped:'greeting_already_sent'};
+    try{
+      const reply=greetingText(new Date(),config.timezone);
+      await sendAndStore(livechat,chatId,reply,'GREETING');
+      await db.logAI({chatId,sourceEventId:eventId||null,intent:'GREETING',action:'AUTO_GREETING_TRIGGER',confidence:1,reply,reason:'LiveChat automatic promo/welcome trigger'});
+      return {sent:true,reply};
+    }catch(e){
+      await db.logError('engine','AUTO_GREETING_TRIGGER_FAILED',e.message,{chatId,eventId});
+      return {error:e.message};
+    }
+  });
+}
+
+function criticalHumanFacts(text=''){
+  const s=String(text||''); const facts=new Set();
+  const patterns=[/https?:\/\/\S+/gi,/\b\d{6,}\b/g,/\b(?:userid|user id|username|password|psw|link login|rekening|nominal)\s*[:=]\s*([^\n]{2,160})/gi];
+  for(const re of patterns){let m;while((m=re.exec(s))){facts.add(String(m[1]||m[0]).trim().replace(/[.,;]+$/,''));}}
+  return [...facts].filter(Boolean).slice(0,20);
+}
+function exactHumanFallback(answer,intent){
+  const a=String(answer||'').trim();
+  if(String(intent||'').toUpperCase()==='FORGOT_PASSWORD' && /(?:password|psw)\s*[:=]/i.test(a)) return `Siap bosku 😊🙏\n${a}\n\nSilakan dicoba terlebih dahulu ya bosku.`.slice(0,1200);
+  return `Baik bosku 😊🙏\n${a}`.slice(0,1200);
+}
+
+export async function answerHumanRequest({request,humanAnswer,saveAsKnowledge=false,livechat}){
+  return db.withChatLock(request.chat_id, async()=>{
+    const systemEnabled=Boolean(await db.getSetting('system_enabled',true));
+    if(!systemEnabled) throw new Error('LIVECHAT_AI_SYSTEM_OFF');
+    if(await db.isHumanTakeover(request.chat_id)) throw new Error('HUMAN_TAKEOVER_ACTIVE');
+    const intent=String(request.intent||'GENERAL').toUpperCase();
+    if(intent==='FORGOT_PASSWORD' && /(?:password|psw)\s*[:=]/i.test(String(humanAnswer||'')) && !resetReplyComplete(humanAnswer)){
+      const e=new Error('RESET_REPLY_INCOMPLETE: wajib sertakan User ID/Username dan Password.'); e.code='RESET_REPLY_INCOMPLETE'; throw e;
+    }
+    const src=await buildSources(request.chat_id,intent,normalizeText(request.member_message));
+    const style=await getReplyStyle();
+    let composed={text:'',usage:null}; let composeError=null;
+    try{
+      composed=await ai.composeFromHuman({memberMessage:request.member_message,intent,humanAnswer,context:src.context,rules:src.rules,knowledge:src.knowledge,style});
+    }catch(e){ composeError=e; await db.logError('engine','HUMAN_COMPOSE_FAILED',e.message,{requestId:request.id,chatId:request.chat_id}); }
+    const facts=criticalHumanFacts(humanAnswer); let finalText=String(composed.text||'').trim();
+    if(!finalText || facts.some(f=>!finalText.includes(f))) finalText=exactHumanFallback(humanAnswer,intent);
+    await sendAndStore(livechat,request.chat_id,finalText,intent);
+    const answered=await db.answerHumanRequest(request.id,{answer:humanAnswer,finalReply:finalText,saveAsKnowledge});
+    if(saveAsKnowledge){
+      await db.pool.query(`INSERT INTO knowledge_base(category,title,content) VALUES($1,$2,$3)`,[intent,`Belajar dari Human Request #${request.id}`,humanAnswer]);
+    }
+    await db.logAI({chatId:request.chat_id,sourceEventId:request.source_event_id,intent,action:'HUMAN_ASSISTED',confidence:1,reply:finalText,reason:`Human Request #${request.id}${composeError?' | fallback_exact':''}`,usage:composed.usage});
+    return answered;
+  });
+}
+
+export async function applyHumanAction({request,action,livechat}){
+  const code=String(action||'').toUpperCase();
+  return db.withChatLock(request.chat_id, async()=>{
+    if(await db.isHumanTakeover(request.chat_id)) throw new Error('HUMAN_TAKEOVER_ACTIVE');
+    const map={
+      RESET_DEPOSIT_FIRST:['#RESET_DEPOSIT_DULU','Silakan melakukan deposit terlebih dahulu ya bosku 🙏 Setelah itu kabari kami lagi untuk proses reset password.'],
+      WD_QUEUE:['#WD_ANTRIAN','WD-nya masih dalam antrian proses ya bosku 🙏 Mohon ditunggu sebentar ya.'],
+      WD_REQUEST_VALID_ACCOUNT:['#MINTA_REK_VALID','Boleh kirim rekening yang valid ya bosku 🙏 Sertakan jenis rekening, nama pemilik, dan nomor rekening/nomor akun.'],
+      WD_DANA_LIMIT:['#DANA_LIMIT','DANA tujuan sedang limit ya bosku. Boleh kirim rekening/e-wallet lain dengan nama pemilik yang sama, lengkap dengan jenis rekening, nama pemilik, dan nomor rekening/nomor akun 🙏'],
+      BONUS_DONE:['#BONUS_DONE','Bonusnya sudah selesai diproses ya bosku 😊 Silakan cek kembali akun bosku.'],
+      BONUS_DEPOSIT_FIRST:['#BONUS_DEPOSIT_DULU','Silakan melakukan deposit terlebih dahulu ya bosku 🙏 Setelah itu kabari kami lagi supaya bisa dibantu cek bonusnya.'],
+      DP_PROCESSED:['#DP_PROCESSED','Depositnya sudah berhasil diproses ya bosku 😊 Silakan refresh saldo akun bosku.'],
+      DP_NOT_FOUND:['#DP_NOT_FOUND','Depositnya belum terlihat masuk ya bosku 🙏 Boleh tunggu sebentar, nanti kami bantu cek lagi.']
+    };
+    if(!map[code]) throw new Error('UNKNOWN_HUMAN_ACTION');
+    const [shortcut,fallback]=map[code]; const reply=await responseText(shortcut,fallback);
+    await sendAndStore(livechat,request.chat_id,reply,request.intent||'GENERAL');
+    if(['WD_REQUEST_VALID_ACCOUNT','WD_DANA_LIMIT'].includes(code)){
+      await db.setConversationWorkflow(request.chat_id,{type:'WD_REPLACEMENT',state:'WAITING_MEMBER_ACCOUNT',data:{sourceAction:code,humanRequestId:request.id}});
+    }
+    const answered=await db.answerHumanRequest(request.id,{answer:`ACTION:${code}`,finalReply:reply,saveAsKnowledge:false});
+    await db.logAI({chatId:request.chat_id,sourceEventId:request.source_event_id,intent:request.intent,action:`HUMAN_ACTION_${code}`,confidence:1,reply,reason:`Human Request #${request.id}`});
+    return answered;
+  });
+}
